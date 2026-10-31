@@ -18,6 +18,9 @@ tokio-util = "0.7"
 futures-util = "0.3"
 wreq = { version = "=6.0.0-rc.31", features = ["json", "stream", "cookies", "gzip", "brotli", "zstd", "query"] }
 sha2 = "0.10"
+aes = "0.8"
+ctr = "0.9"
+base64 = "0.22"
 rand = "0.8"
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 keyring = { version = "3", features = ["windows-native"] }

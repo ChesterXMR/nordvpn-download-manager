@@ -60,6 +60,8 @@ pub fn http_error(status: StatusCode) -> anyhow::Error {
     match status.as_u16() {
         407 => fatal("NordVPN rejected the proxy credentials (HTTP 407). Check your service credentials in Settings."),
         403 => blocked(format!("The site refused this NordVPN server (HTTP {status})")),
+        // Per-IP transfer quotas (e.g. MEGA); another server has its own quota.
+        509 => blocked(format!("This NordVPN server used up the site's transfer limit (HTTP {status})")),
         408 | 425 | 429 => anyhow!(msg),
         400..=499 => fatal(msg),
         _ => anyhow!(msg),
@@ -201,6 +203,17 @@ pub fn make_sparse(file: &File) {
 #[cfg(not(windows))]
 pub fn make_sparse(_file: &File) {}
 
+/// Adds the Mark of the Web, as browsers do, so Windows SmartScreen and Office treat the file as
+/// downloaded from the internet. Best effort: FAT/exFAT drives have no alternate data streams.
+#[cfg(windows)]
+pub fn mark_from_internet(path: &Path, url: &str) {
+    let stream = format!("{}:Zone.Identifier", path.display());
+    let _ = std::fs::write(stream, format!("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl={url}\r\n"));
+}
+
+#[cfg(not(windows))]
+pub fn mark_from_internet(_path: &Path, _url: &str) {}
+
 #[cfg(windows)]
 pub fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
@@ -232,5 +245,16 @@ mod tests {
         assert!(is_fatal(&missing) && !is_blocked(&missing));
         let busy = http_error(StatusCode::TOO_MANY_REQUESTS);
         assert!(!is_fatal(&busy) && !is_blocked(&busy));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finished_files_are_marked_as_downloaded() {
+        let path = std::env::temp_dir().join(format!("norddm-motw-{}.exe", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"x").unwrap();
+        mark_from_internet(&path, "https://example.com/a.exe");
+        let zone = std::fs::read_to_string(format!("{}:Zone.Identifier", path.display())).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(zone.contains("ZoneId=3") && zone.contains("HostUrl=https://example.com/a.exe"), "{zone}");
     }
 }

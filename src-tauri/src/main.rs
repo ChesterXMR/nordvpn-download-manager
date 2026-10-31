@@ -3,6 +3,7 @@
 mod browser;
 mod commands;
 mod engine;
+mod mega;
 mod nord;
 mod recommend;
 mod settings;

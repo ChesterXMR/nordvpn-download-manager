@@ -24,7 +24,7 @@ use wreq::{
     Client,
 };
 
-use crate::{browser, settings, util};
+use crate::{browser, mega, settings, util};
 
 const API: &str = "https://api.gofile.io";
 /// Salt embedded in gofile's `wt.obf.js`; gofile rotates it occasionally.
@@ -233,18 +233,63 @@ fn direct_link_headers() -> Result<HeaderMap> {
     Ok(gofile_download_headers(&token))
 }
 
-/// Prepares `url` for transfer: possibly replaces the link and returns per-request headers.
-pub async fn prepare(client: &Client, url: &str) -> Result<(String, HeaderMap)> {
+/// What a transfer needs to fetch a pasted link.
+pub struct Prepared {
+    /// The address to download, possibly different from the pasted link.
+    pub url: String,
+    /// Sent with every request (session cookies, auth).
+    pub headers: HeaderMap,
+    /// Decrypts the received bytes (MEGA files are encrypted).
+    pub cipher: Option<mega::Cipher>,
+    /// The real file name, when the download address doesn't reveal it.
+    pub file_name: Option<String>,
+}
+
+impl Prepared {
+    fn plain(url: String, headers: HeaderMap) -> Self {
+        Self { url, headers, cipher: None, file_name: None }
+    }
+}
+
+/// Prepares `url` for transfer: possibly replaces the link and adds headers or decryption.
+pub async fn prepare(client: &Client, url: &str) -> Result<Prepared> {
     let Ok(parsed) = Url::parse(url) else {
-        return Ok((url.to_owned(), HeaderMap::new()));
+        return Ok(Prepared::plain(url.to_owned(), HeaderMap::new()));
     };
+    if let Some(link) = mega::parse(&parsed) {
+        let resolved = mega::resolve(client, &link).await?;
+        return Ok(Prepared {
+            url: resolved.url,
+            headers: HeaderMap::new(),
+            cipher: Some(resolved.cipher),
+            file_name: Some(resolved.name),
+        });
+    }
+    if mega::is_mega(&parsed) {
+        return Err(util::fatal("That MEGA link is incomplete; copy it again including the part after #"));
+    }
+    let (url, headers) = prepare_gofile(client, parsed).await?;
+    Ok(Prepared::plain(url, headers))
+}
+
+async fn prepare_gofile(client: &Client, mut parsed: Url) -> Result<(String, HeaderMap)> {
+    if !is_gofile(&parsed) {
+        return Ok((parsed.into(), HeaderMap::new()));
+    }
+    // gofile requests carry the account token, so they must never go out over plain http.
+    let _ = parsed.set_scheme("https");
     if let Some(id) = content_id(&parsed) {
-        return resolve(client, &id).await;
+        let (link, headers) = resolve(client, &id).await?;
+        let resolved = Url::parse(&link).ok().filter(|u| u.scheme() == "https" && is_gofile(u));
+        let Some(resolved) = resolved else {
+            bail!("gofile.io returned an unexpected download link");
+        };
+        return Ok((resolved.into(), headers));
     }
-    if is_gofile(&parsed) && !is_public_direct_link(&parsed) {
-        return Ok((url.to_owned(), direct_link_headers()?));
+    if is_public_direct_link(&parsed) {
+        return Ok((parsed.into(), HeaderMap::new()));
     }
-    Ok((url.to_owned(), HeaderMap::new()))
+    Ok((parsed.into(), direct_link_headers()?))
 }
 
 /// Explains a gofile link that still returned its web page despite the session cookie.
@@ -287,6 +332,16 @@ mod tests {
         assert_eq!(content_id(&parse("https://example.com/d/abc")), None);
     }
 
+    #[tokio::test]
+    async fn gofile_links_are_upgraded_to_https() {
+        let client = Client::builder().build().unwrap();
+        let prepared = prepare(&client, "http://store1.gofile.io/download/direct/xyz/f.mp4").await.unwrap();
+        assert_eq!(prepared.url, "https://store1.gofile.io/download/direct/xyz/f.mp4");
+        assert!(prepared.headers.is_empty());
+        let prepared = prepare(&client, "http://example.com/f.mp4").await.unwrap();
+        assert_eq!(prepared.url, "http://example.com/f.mp4", "other sites are left alone");
+    }
+
     /// Talks to the real gofile.io API through a NordVPN server (saved sign-in), as the app does:
     /// `cargo test live_gofile -- --ignored --nocapture`.
     /// Set GOFILE_TEST_URL to a gofile.io link to also test preparing and fetching it.
@@ -299,9 +354,9 @@ mod tests {
         let token = create_guest_account(&client).await.expect("guest account");
         assert!(!token.is_empty());
         if let Ok(url) = std::env::var("GOFILE_TEST_URL") {
-            let (link, headers) = prepare(&client, &url).await.expect("prepared link");
-            println!("resolved: {link}");
-            let response = client.get(&link).headers(headers).send().await.unwrap();
+            let prepared = prepare(&client, &url).await.expect("prepared link");
+            println!("resolved: {}", prepared.url);
+            let response = client.get(&prepared.url).headers(prepared.headers).send().await.unwrap();
             println!("status: {}", response.status());
             assert!(response.status().is_success());
             let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok());

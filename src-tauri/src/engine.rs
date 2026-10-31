@@ -7,7 +7,7 @@
 //! restarts (on a freshly chosen server).
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::{
@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-    browser,
+    browser, mega,
     nord::{self, Selected, ServerInfo},
     recommend::{self, MAX_CONNECTIONS},
     settings::{self, Credentials, Settings},
@@ -116,11 +116,49 @@ pub struct DownloadRecord {
     /// The name was guessed from the URL and may be replaced by the server's Content-Disposition.
     #[serde(default)]
     auto_name: bool,
+    /// A MEGA folder link: `file_name` is a folder and `segments[i]` tracks `folder[i]`'s bytes.
+    #[serde(default)]
+    pub is_folder: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    folder: Vec<FolderEntry>,
+}
+
+/// One file of a folder download.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FolderEntry {
+    handle: String,
+    /// Path below the download's folder, '/'-separated, every part sanitized.
+    path: String,
+    size: u64,
+}
+
+/// Segments as the progress bar needs them: finished neighbours merged, untouched ones dropped.
+/// Keeps updates small for folders with thousands of files.
+fn display_segments(segments: &[Segment]) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::new();
+    for s in segments.iter().filter(|s| s.pos > s.start) {
+        match out.last_mut() {
+            Some(last) if last.pos >= last.end && last.end == s.start => {
+                last.end = s.end;
+                last.pos = s.pos;
+            }
+            _ => out.push(s.clone()),
+        }
+    }
+    out
 }
 
 impl DownloadRecord {
     fn downloaded(&self) -> u64 {
         self.segments.iter().map(|s| s.pos - s.start).sum()
+    }
+
+    /// The record as the UI sees it, without the (possibly huge) folder file list.
+    fn for_display(&self) -> Self {
+        let mut rec = self.clone();
+        rec.folder = Vec::new();
+        rec.segments = display_segments(&self.segments);
+        rec
     }
 
     fn apply_probe(&mut self, probe: &Probe) {
@@ -136,6 +174,9 @@ impl DownloadRecord {
     }
 
     fn part_path(&self) -> PathBuf {
+        if self.is_folder {
+            return self.final_path();
+        }
         Path::new(&self.dir).join(format!("{}.part", self.file_name))
     }
 
@@ -273,9 +314,12 @@ impl Download {
     }
 
     fn view(&self) -> DownloadView {
-        let record = lock(&self.rec).clone();
+        let (record, downloaded) = {
+            let rec = lock(&self.rec);
+            (rec.for_display(), rec.downloaded())
+        };
         DownloadView {
-            downloaded: record.downloaded(),
+            downloaded,
             speed: *lock(&self.speed),
             active_connections: self.active.load(Relaxed),
             record,
@@ -406,9 +450,13 @@ impl DownloadManager {
         if dir.is_empty() {
             bail!("Choose a download folder in Settings first");
         }
+        let parsed = Url::parse(&url).ok();
+        let is_folder = matches!(
+            parsed.as_ref().and_then(mega::parse),
+            Some(mega::Link::Folder { file: None, .. })
+        );
         // A provisional name from the URL; replaced by the server's file name once the link is probed.
-        let name = Url::parse(&url)
-            .ok()
+        let name = parsed
             .as_ref()
             .and_then(util::filename_from_url)
             .unwrap_or_else(|| "download".into());
@@ -440,6 +488,8 @@ impl DownloadManager {
             completed_at: None,
             prepared: false,
             auto_name: true,
+            is_folder,
+            folder: Vec::new(),
         };
         let download = Arc::new(Download::new(rec));
         lock(&self.downloads).insert(0, download.clone());
@@ -501,11 +551,15 @@ impl DownloadManager {
         let download = self.find(id)?;
         self.stop(&download).await;
         lock(&self.downloads).retain(|d| !Arc::ptr_eq(d, &download));
-        let (status, part, final_path) = {
+        let (status, part, final_path, folder) = {
             let rec = lock(&download.rec);
-            (rec.status, rec.part_path(), rec.final_path())
+            (rec.status, rec.part_path(), rec.final_path(), rec.folder.clone())
         };
         if status != Status::Completed {
+            // A folder download only leaves partial `.part` files; finished files are kept.
+            for entry in &folder {
+                let _ = fs::remove_file(part_file(&final_path.join(&entry.path)));
+            }
             let _ = fs::remove_file(part);
         } else if delete_file {
             let _ = fs::remove_file(final_path);
@@ -606,30 +660,38 @@ impl DownloadManager {
     }
 
     async fn transfer(&self, download: &Arc<Download>, client: &Client, cancel: &CancellationToken) -> Result<Outcome> {
-        let (url, prepared) = {
+        let (url, prepared, is_folder) = {
             let rec = lock(&download.rec);
-            (rec.url.clone(), rec.prepared)
+            (rec.url.clone(), rec.prepared, rec.is_folder)
         };
+        if is_folder {
+            let link = Url::parse(&url).ok().as_ref().and_then(mega::parse);
+            let Some(mega::Link::Folder { handle, key, .. }) = link else {
+                return Err(util::fatal("This MEGA folder link can no longer be read"));
+            };
+            return self.transfer_folder(download, client, &handle, &key, cancel).await;
+        }
         self.set_status(download, Status::Connecting, Some("Inspecting the link…".into()));
         // Site-specific preparation may replace the pasted link (a gofile page link becomes the
         // file's direct address) and produce headers every connection must send.
-        let (url, headers) = tokio::select! {
+        let site = tokio::select! {
             _ = cancel.cancelled() => return Ok(Outcome::Cancelled),
             prepared = sites::prepare(client, &url) => prepared?,
         };
         if !prepared {
             let probe = tokio::select! {
                 _ = cancel.cancelled() => return Ok(Outcome::Cancelled),
-                probe = probe(client, &url, &headers) => probe?,
+                probe = probe(client, &site.url, &site.headers) => probe?,
             };
             let (id, dir, auto_name) = {
                 let rec = lock(&download.rec);
                 (rec.id.clone(), rec.dir.clone(), rec.auto_name)
             };
             let taken = if auto_name { self.names_in(&dir, &id) } else { HashSet::new() };
+            let name = site.file_name.as_deref().map(util::sanitize_filename).unwrap_or(probe.file_name.clone());
             let mut rec = lock(&download.rec);
             if auto_name {
-                rec.file_name = util::unique_name(Path::new(&dir), &probe.file_name, &taken, true);
+                rec.file_name = util::unique_name(Path::new(&dir), &name, &taken, true);
                 rec.auto_name = false;
             }
             rec.apply_probe(&probe);
@@ -637,7 +699,7 @@ impl DownloadManager {
 
         let part_path = lock(&download.rec).part_path();
         self.set_status(download, Status::Downloading, None);
-        run_workers(download, client, &headers, &url, &part_path, cancel).await?;
+        run_workers(download, client, &site.headers, &site.url, site.cipher, &part_path, cancel).await?;
         if cancel.is_cancelled() {
             return Ok(Outcome::Cancelled);
         }
@@ -645,12 +707,99 @@ impl DownloadManager {
         Ok(Outcome::Completed)
     }
 
+    /// Downloads every file of a MEGA folder, `connections` files at a time, into a folder
+    /// named after it. Finished files are kept across pauses, restarts and server switches.
+    async fn transfer_folder(
+        &self,
+        download: &Arc<Download>,
+        client: &Client,
+        handle: &str,
+        key: &[u8; 16],
+        cancel: &CancellationToken,
+    ) -> Result<Outcome> {
+        self.set_status(download, Status::Connecting, Some("Reading the MEGA folder…".into()));
+        let (root, files) = tokio::select! {
+            _ = cancel.cancelled() => return Ok(Outcome::Cancelled),
+            listed = mega::list_folder(client, handle, key) => listed?,
+        };
+        if !lock(&download.rec).prepared {
+            let (id, dir) = {
+                let rec = lock(&download.rec);
+                (rec.id.clone(), rec.dir.clone())
+            };
+            let taken = self.names_in(&dir, &id);
+            let name = util::unique_name(Path::new(&dir), &util::sanitize_filename(&root), &taken, true);
+            let mut rec = lock(&download.rec);
+            rec.file_name = name;
+            rec.auto_name = false;
+            // MEGA allows duplicate names in a folder; Windows doesn't.
+            let mut seen = HashSet::new();
+            rec.folder = files
+                .iter()
+                .map(|f| {
+                    let base = f.dir.iter().chain([&f.name]).map(|p| util::sanitize_filename(p)).collect::<Vec<_>>().join("/");
+                    let path = (0..).map(|n| numbered(&base, n)).find(|p| seen.insert(p.to_lowercase())).unwrap();
+                    FolderEntry { handle: f.handle.clone(), path, size: f.size }
+                })
+                .collect();
+            let mut offset = 0;
+            rec.segments = rec
+                .folder
+                .iter()
+                .map(|f| {
+                    let segment = Segment::new(offset, offset + f.size);
+                    offset += f.size;
+                    segment
+                })
+                .collect();
+            rec.total_size = Some(offset);
+            rec.resumable = true;
+            rec.prepared = true;
+        }
+        let keys: HashMap<String, [u8; 32]> = files.into_iter().map(|f| (f.handle, f.key)).collect();
+        let (root_dir, connections, url) = {
+            let rec = lock(&download.rec);
+            (rec.final_path(), rec.connections, rec.url.clone())
+        };
+
+        let job = Arc::new(FolderJob {
+            download: download.clone(),
+            client: client.clone(),
+            folder: handle.to_owned(),
+            keys,
+            root_dir,
+            source_url: url,
+            cancel: cancel.clone(),
+        });
+        job.reconcile()?;
+        self.set_status(download, Status::Downloading, None);
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..connections {
+            workers.spawn(job.clone().worker());
+        }
+        let last_err = join_workers(&mut workers).await;
+        if cancel.is_cancelled() {
+            return Ok(Outcome::Cancelled);
+        }
+        let mut rec = lock(&download.rec);
+        if rec.segments.iter().all(|s| s.pos >= s.end) {
+            // The per-file bookkeeping is no longer needed; keep the saved list small.
+            let total = rec.total_size.unwrap_or(0);
+            rec.segments = vec![Segment { start: 0, end: total, pos: total, busy: false }];
+            rec.folder = Vec::new();
+            return Ok(Outcome::Completed);
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("The download stopped before finishing")))
+    }
+
     fn finalize(&self, download: &Arc<Download>, part_path: &Path) -> Result<()> {
         let mut rec = lock(&download.rec);
         let dir = PathBuf::from(&rec.dir);
         let name = util::unique_name(&dir, &rec.file_name, &HashSet::new(), false);
-        fs::rename(part_path, dir.join(&name))
+        let path = dir.join(&name);
+        fs::rename(part_path, &path)
             .map_err(|e| util::fatal(format!("Could not move the finished file into place: {e}")))?;
+        util::mark_from_internet(&path, &rec.url);
         rec.file_name = name;
         Ok(())
     }
@@ -710,7 +859,7 @@ impl DownloadManager {
                             .filter(|_| *speed > 1.0)
                             .map(|total| total.saturating_sub(downloaded) as f64 / *speed),
                         active_connections: download.active.load(Relaxed),
-                        segments: rec.segments.clone(),
+                        segments: display_segments(&rec.segments),
                     });
                 }
                 if !updates.is_empty() {
@@ -748,6 +897,7 @@ async fn run_workers(
     client: &Client,
     headers: &HeaderMap,
     url: &str,
+    cipher: Option<mega::Cipher>,
     part_path: &Path,
     cancel: &CancellationToken,
 ) -> Result<()> {
@@ -767,12 +917,251 @@ async fn run_workers(
         resumable,
         total,
         file: Arc::new(file),
+        cipher,
         cancel: cancel.clone(),
     });
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..if resumable { connections.max(1) } else { 1 } {
         workers.spawn(transfer.clone().worker());
     }
+    let last_err = join_workers(&mut workers).await;
+    drop(transfer); // closes the file so it can be renamed
+
+    let complete = lock(&download.rec).segments.iter().all(|s| s.pos >= s.end);
+    if complete || cancel.is_cancelled() {
+        return Ok(());
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("The download stopped before finishing")))
+}
+
+/// `a/b/name.ext`, or `a/b/name (n).ext` for n > 0.
+fn numbered(path: &str, n: usize) -> String {
+    if n == 0 {
+        return path.to_string();
+    }
+    let (dir, name) = path.rsplit_once('/').map_or(("", path), |(d, f)| (d, f));
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    let name = format!("{stem} ({n}){ext}");
+    if dir.is_empty() { name } else { format!("{dir}/{name}") }
+}
+
+fn part_file(path: &Path) -> PathBuf {
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    PathBuf::from(part)
+}
+
+/// Downloads the files of a MEGA folder through one NordVPN server; each worker fetches one
+/// whole file at a time. `segments[i]` (offsets within the folder's total) tracks `folder[i]`.
+struct FolderJob {
+    download: Arc<Download>,
+    client: Client,
+    folder: String,
+    keys: HashMap<String, [u8; 32]>,
+    root_dir: PathBuf,
+    /// The pasted link, recorded in each file's Mark of the Web.
+    source_url: String,
+    cancel: CancellationToken,
+}
+
+impl FolderJob {
+    fn path(&self, entry: &FolderEntry) -> PathBuf {
+        self.root_dir.join(&entry.path)
+    }
+
+    /// Brings the recorded progress in line with the disk: finishes renames interrupted by a
+    /// crash, creates empty files, and restarts files whose partial download went missing.
+    fn reconcile(&self) -> Result<()> {
+        let (entries, segments) = {
+            let rec = lock(&self.download.rec);
+            (rec.folder.clone(), rec.segments.clone())
+        };
+        let mut restart = Vec::new();
+        for (i, (entry, segment)) in entries.iter().zip(&segments).enumerate() {
+            let path = self.path(entry);
+            let part = part_file(&path);
+            if entry.size == 0 {
+                if !path.exists() {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    File::create(&path).map_err(|e| util::fatal(format!("Could not create {}: {e}", path.display())))?;
+                }
+            } else if segment.pos >= segment.end {
+                if !path.exists() {
+                    if part.exists() {
+                        fs::rename(&part, &path)?;
+                        util::mark_from_internet(&path, &self.source_url);
+                    } else {
+                        restart.push(i);
+                    }
+                }
+            } else if segment.pos > segment.start && !part.exists() {
+                restart.push(i);
+            }
+        }
+        let mut rec = lock(&self.download.rec);
+        for i in restart {
+            rec.segments[i].pos = rec.segments[i].start;
+        }
+        Ok(())
+    }
+
+    async fn worker(self: Arc<Self>) -> Result<()> {
+        while let Some(idx) = self.claim() {
+            self.download.active.fetch_add(1, Relaxed);
+            let result = with_retries(&self.cancel, || self.position(idx), || self.fetch(idx)).await;
+            self.download.active.fetch_sub(1, Relaxed);
+            lock(&self.download.rec).segments[idx].busy = false;
+            if self.cancel.is_cancelled() {
+                return Ok(());
+            }
+            result?;
+        }
+        Ok(())
+    }
+
+    fn claim(&self) -> Option<usize> {
+        let mut rec = lock(&self.download.rec);
+        let i = rec.segments.iter().position(|s| !s.busy && s.pos < s.end)?;
+        rec.segments[i].busy = true;
+        Some(i)
+    }
+
+    fn position(&self, idx: usize) -> u64 {
+        lock(&self.download.rec).segments[idx].pos
+    }
+
+    /// One attempt at fetching file `idx`, continuing from its `.part` file.
+    async fn fetch(&self, idx: usize) -> Result<()> {
+        let (entry, start, end) = {
+            let rec = lock(&self.download.rec);
+            (rec.folder[idx].clone(), rec.segments[idx].start, rec.segments[idx].end)
+        };
+        let done = self.position(idx) - start;
+        let Some(key) = self.keys.get(&entry.handle) else {
+            return Err(util::fatal(format!("{} is no longer in the MEGA folder", entry.path)));
+        };
+        let resolved = tokio::select! {
+            _ = self.cancel.cancelled() => return Ok(()),
+            resolved = mega::resolve_in_folder(&self.client, &self.folder, &entry.handle, key) => resolved?,
+        };
+        let path = self.path(&entry);
+        let part = part_file(&path);
+        let file = open_part(&part, None, done == 0)
+            .map_err(|e| util::fatal(format!("Could not open {}: {e}", part.display())))?;
+        let file = Arc::new(file);
+
+        let mut request = self.client.get(&resolved.url);
+        if done > 0 {
+            request = request.header(header::RANGE, format!("bytes={done}-"));
+        }
+        let response = tokio::select! {
+            _ = self.cancel.cancelled() => return Ok(()),
+            response = request.send() => response?,
+        };
+        let status = response.status();
+        if !status.is_success() {
+            return Err(util::http_error(status));
+        }
+        if done > 0 && status != StatusCode::PARTIAL_CONTENT {
+            lock(&self.download.rec).segments[idx].pos = start;
+            bail!("MEGA ignored the resume position; restarting {}", entry.path);
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buf = Vec::with_capacity(FLUSH_SIZE + (256 << 10));
+        loop {
+            let next = tokio::select! {
+                _ = self.cancel.cancelled() => {
+                    self.flush(idx, &file, &resolved.cipher, &mut buf).await?;
+                    return Ok(());
+                }
+                next = stream.next() => next,
+            };
+            match next {
+                Some(Ok(chunk)) => {
+                    self.download.received.fetch_add(chunk.len() as u64, Relaxed);
+                    buf.extend_from_slice(&chunk);
+                    if buf.len() >= FLUSH_SIZE {
+                        self.flush(idx, &file, &resolved.cipher, &mut buf).await?;
+                    }
+                }
+                Some(Err(e)) => {
+                    self.flush(idx, &file, &resolved.cipher, &mut buf).await?;
+                    return Err(e.into());
+                }
+                None => {
+                    self.flush(idx, &file, &resolved.cipher, &mut buf).await?;
+                    break;
+                }
+            }
+        }
+        if self.position(idx) < end {
+            bail!("The connection closed before {} finished", entry.path);
+        }
+        drop(file);
+        fs::rename(&part, &path)
+            .map_err(|e| util::fatal(format!("Could not move {} into place: {e}", path.display())))?;
+        util::mark_from_internet(&path, &self.source_url);
+        Ok(())
+    }
+
+    /// Decrypts and writes buffered bytes at the file's current position.
+    async fn flush(&self, idx: usize, file: &Arc<File>, cipher: &mega::Cipher, buf: &mut Vec<u8>) -> Result<()> {
+        let (start, pos, end) = {
+            let rec = lock(&self.download.rec);
+            let s = &rec.segments[idx];
+            (s.start, s.pos, s.end)
+        };
+        let len = (buf.len() as u64).min(end - pos) as usize;
+        if len > 0 {
+            let data = std::mem::take(buf);
+            *buf = write_chunk(file.clone(), data, len, pos - start, Some(cipher.clone())).await?;
+            lock(&self.download.rec).segments[idx].pos = pos + len as u64;
+        }
+        buf.clear();
+        Ok(())
+    }
+}
+
+/// Runs `attempt` until it succeeds, retrying dropped connections with backoff. An attempt that
+/// moved `position` forward resets the retry budget; fatal and blocked errors return at once.
+async fn with_retries<Fut: std::future::Future<Output = Result<()>>>(
+    cancel: &CancellationToken,
+    position: impl Fn() -> u64,
+    mut attempt: impl FnMut() -> Fut,
+) -> Result<()> {
+    let mut attempts = 0;
+    loop {
+        let before = position();
+        let err = match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if cancel.is_cancelled() || util::is_fatal(&err) || util::is_blocked(&err) {
+            return Err(err);
+        }
+        if position() > before {
+            attempts = 0;
+        }
+        attempts += 1;
+        if attempts > MAX_SEGMENT_RETRIES {
+            return Err(err);
+        }
+        let delay = Duration::from_millis(500 << attempts.min(5));
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+/// Waits for every worker and returns the most relevant error: a fatal one if any.
+async fn join_workers(workers: &mut tokio::task::JoinSet<Result<()>>) -> Option<anyhow::Error> {
     let mut last_err: Option<anyhow::Error> = None;
     while let Some(joined) = workers.join_next().await {
         match joined {
@@ -785,13 +1174,30 @@ async fn run_workers(
             Err(e) => last_err = Some(anyhow!("A download worker crashed: {e}")),
         }
     }
-    drop(transfer); // closes the file so it can be renamed
+    last_err
+}
 
-    let complete = lock(&download.rec).segments.iter().all(|s| s.pos >= s.end);
-    if complete || cancel.is_cancelled() {
-        return Ok(());
+/// Decrypts (when needed) and writes `data[..len]` at `offset` without blocking the runtime.
+async fn write_chunk(
+    file: Arc<File>,
+    mut data: Vec<u8>,
+    len: usize,
+    offset: u64,
+    cipher: Option<mega::Cipher>,
+) -> Result<Vec<u8>> {
+    let written = tokio::task::spawn_blocking(move || {
+        if let Some(cipher) = &cipher {
+            cipher.apply(offset, &mut data[..len]);
+        }
+        let result = util::write_all_at(&file, &data[..len], offset);
+        (data, result)
+    })
+    .await;
+    match written {
+        Ok((data, Ok(()))) => Ok(data),
+        Ok((_, Err(e))) => Err(util::fatal(format!("Could not write to disk: {e}"))),
+        Err(e) => Err(anyhow!("Disk write task failed: {e}")),
     }
-    Err(last_err.unwrap_or_else(|| anyhow!("The download stopped before finishing")))
 }
 
 fn open_part(path: &Path, preallocate: Option<u64>, fresh: bool) -> std::io::Result<File> {
@@ -819,6 +1225,8 @@ struct Transfer {
     resumable: bool,
     total: Option<u64>,
     file: Arc<File>,
+    /// Decrypts received bytes in place before they're written (MEGA).
+    cipher: Option<mega::Cipher>,
     cancel: CancellationToken,
 }
 
@@ -876,29 +1284,7 @@ impl Transfer {
     }
 
     async fn run_segment(&self, idx: usize) -> Result<()> {
-        let mut attempts = 0;
-        loop {
-            let before = self.position(idx).0;
-            let err = match self.fetch(idx).await {
-                Ok(()) => return Ok(()),
-                Err(e) => e,
-            };
-            if self.cancel.is_cancelled() || util::is_fatal(&err) || util::is_blocked(&err) {
-                return Err(err);
-            }
-            if self.position(idx).0 > before {
-                attempts = 0;
-            }
-            attempts += 1;
-            if attempts > MAX_SEGMENT_RETRIES {
-                return Err(err);
-            }
-            let delay = Duration::from_millis(500 << attempts.min(5));
-            tokio::select! {
-                _ = self.cancel.cancelled() => return Ok(()),
-                _ = tokio::time::sleep(delay) => {}
-            }
-        }
+        with_retries(&self.cancel, || self.position(idx).0, || self.fetch(idx)).await
     }
 
     async fn fetch(&self, idx: usize) -> Result<()> {
@@ -1012,24 +1398,13 @@ impl Transfer {
             (offset, len as usize, segment.pos >= segment.end)
         };
         if len > 0 {
-            let file = self.file.clone();
             let data = std::mem::take(buf);
-            let written = tokio::task::spawn_blocking(move || {
-                let result = util::write_all_at(&file, &data[..len], offset);
-                (data, result)
-            })
-            .await;
-            let failure = match written {
-                Ok((data, Ok(()))) => {
-                    *buf = data;
-                    None
+            match write_chunk(self.file.clone(), data, len, offset, self.cipher.clone()).await {
+                Ok(data) => *buf = data,
+                Err(err) => {
+                    lock(&self.download.rec).segments[idx].pos = offset;
+                    return Err(err);
                 }
-                Ok((_, Err(e))) => Some(util::fatal(format!("Could not write to disk: {e}"))),
-                Err(e) => Some(anyhow!("Disk write task failed: {e}")),
-            };
-            if let Some(err) = failure {
-                lock(&self.download.rec).segments[idx].pos = offset;
-                return Err(err);
             }
         }
         buf.clear();
@@ -1146,6 +1521,8 @@ mod tests {
             completed_at: None,
             prepared: false,
             auto_name: false,
+            is_folder: false,
+            folder: Vec::new(),
         };
         rec.apply_probe(&probe);
         (Arc::new(Download::new(rec)), client)
@@ -1165,7 +1542,7 @@ mod tests {
             assert_eq!(rec.segments.len(), 6);
         }
         let part = lock(&download.rec).part_path();
-        run_workers(&download, &client, &HeaderMap::new(), &url, &part, &CancellationToken::new()).await.unwrap();
+        run_workers(&download, &client, &HeaderMap::new(), &url, None, &part, &CancellationToken::new()).await.unwrap();
 
         let rec = lock(&download.rec);
         assert!(rec.segments.iter().all(|s| s.pos == s.end));
@@ -1189,14 +1566,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             canceller.cancel();
         });
-        run_workers(&download, &client, &HeaderMap::new(), &url, &part, &cancel).await.unwrap();
+        run_workers(&download, &client, &HeaderMap::new(), &url, None, &part, &cancel).await.unwrap();
         let partial = lock(&download.rec).downloaded();
         assert!(partial > 0 && partial < data.len() as u64, "expected partial progress, got {partial}");
 
         // Simulate an app restart: busy flags aren't persisted.
         let json = serde_json::to_string(&*lock(&download.rec)).unwrap();
         let restored = Arc::new(Download::new(serde_json::from_str(&json).unwrap()));
-        run_workers(&restored, &client, &HeaderMap::new(), &url, &part, &CancellationToken::new()).await.unwrap();
+        run_workers(&restored, &client, &HeaderMap::new(), &url, None, &part, &CancellationToken::new()).await.unwrap();
         assert_eq!(lock(&restored.rec).downloaded(), data.len() as u64);
         assert!(fs::read(&part).unwrap() == *data, "file content differs after resume");
         fs::remove_dir_all(dir).unwrap();
@@ -1214,7 +1591,7 @@ mod tests {
             assert_eq!(rec.connections, 1);
         }
         let part = lock(&download.rec).part_path();
-        run_workers(&download, &client, &HeaderMap::new(), &url, &part, &CancellationToken::new()).await.unwrap();
+        run_workers(&download, &client, &HeaderMap::new(), &url, None, &part, &CancellationToken::new()).await.unwrap();
         assert!(fs::read(&part).unwrap() == *data, "file content differs");
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1275,6 +1652,135 @@ mod tests {
         println!("removed an active download in {:?}", removing.elapsed());
         assert!(!c.record.part_path().exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A MEGA folder through the saved NordVPN sign-in: downloads part of it, pauses, resumes,
+    /// checks decrypted files, fetches one file via the parallel single-file path and compares:
+    /// `MEGA_TEST_URL=<folder link> cargo test live_mega_engine -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn live_mega_engine() {
+        let url = std::env::var("MEGA_TEST_URL").expect("MEGA_TEST_URL");
+        let dir = temp_dir();
+        let manager = DownloadManager::new(Box::new(|_, _| {}), dir.join("data"), dir.clone()).unwrap();
+        let folder = manager.add(AddRequest { url: url.clone(), connections: Some(8) }).unwrap();
+        let id = folder.record.id.clone();
+        let wait_downloading = |secs: u64| {
+            let manager = manager.clone();
+            let id = id.clone();
+            async move {
+                let started = Instant::now();
+                while started.elapsed() < Duration::from_secs(secs) {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let view = manager.find(&id).unwrap().view();
+                    println!(
+                        "{:>4.0}s {:?} {} of {:?} bytes, {} active  {:?}",
+                        started.elapsed().as_secs_f64(),
+                        view.record.status,
+                        view.downloaded,
+                        view.record.total_size,
+                        view.active_connections,
+                        view.record.status_text
+                    );
+                    assert_ne!(view.record.status, Status::Error, "{:?}", view.record.error);
+                }
+            }
+        };
+        wait_downloading(60).await;
+        manager.pause(&id).await.unwrap();
+        let download = manager.find(&id).unwrap();
+        let (root, entries, segments, first_pass) = {
+            let rec = lock(&download.rec);
+            (rec.final_path(), rec.folder.clone(), rec.segments.clone(), rec.downloaded())
+        };
+        assert!(first_pass > 0, "nothing downloaded");
+        let finished: Vec<_> = entries.iter().zip(&segments).filter(|(e, s)| e.size > 0 && s.pos >= s.end).collect();
+        println!("paused after {first_pass} bytes; {} files finished", finished.len());
+        assert!(!finished.is_empty());
+        for (entry, _) in &finished {
+            let bytes = fs::read(root.join(&entry.path)).unwrap();
+            assert_eq!(bytes.len() as u64, entry.size, "{}", entry.path);
+            let image = bytes.starts_with(&[0xFF, 0xD8, 0xFF]) || bytes.starts_with(b"\x89PNG");
+            let lower = entry.path.to_lowercase();
+            if lower.ends_with(".jpg") || lower.ends_with(".png") || lower.ends_with(".jpeg") {
+                assert!(image, "{} doesn't decrypt to an image", entry.path);
+            }
+        }
+
+        manager.resume(&id).await.unwrap();
+        wait_downloading(40).await;
+        manager.pause(&id).await.unwrap();
+        let second_pass = lock(&download.rec).downloaded();
+        println!("after resuming: {second_pass} bytes");
+        assert!(second_pass > first_pass, "resume should continue, not restart");
+
+        // The same file through the parallel single-file path must decrypt identically.
+        let (entry, _) = finished[0];
+        let single_url = format!("{}/file/{}", url.trim_end_matches('/'), entry.handle);
+        let single = manager.add(AddRequest { url: single_url, connections: Some(4) }).unwrap();
+        let started = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let view = manager.find(&single.record.id).unwrap().view();
+            match view.record.status {
+                Status::Completed => break,
+                Status::Error => panic!("{:?}", view.record.error),
+                _ => assert!(started.elapsed() < Duration::from_secs(120), "single file took too long"),
+            }
+        }
+        let single_rec = lock(&manager.find(&single.record.id).unwrap().rec).clone();
+        println!("single file {} via {:?}", single_rec.file_name, single_rec.server.as_ref().map(|s| &s.hostname));
+        assert_eq!(
+            fs::read(single_rec.final_path()).unwrap(),
+            fs::read(root.join(&entry.path)).unwrap(),
+            "parallel and folder downloads differ"
+        );
+
+        // Removing a running folder closes its NordVPN connections and deletes only partial files.
+        let nord_connections = || {
+            let out = std::process::Command::new("netstat").args(["-ano", "-p", "tcp"]).output().unwrap();
+            let pid = std::process::id().to_string();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| {
+                    let cols: Vec<&str> = l.split_whitespace().collect();
+                    cols.len() == 5 && cols[2].ends_with(":89") && cols[3] == "ESTABLISHED" && cols[4] == pid
+                })
+                .count()
+        };
+        manager.resume(&id).await.unwrap();
+        wait_downloading(20).await;
+        let before = nord_connections();
+        manager.remove(&id, false).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let after = nord_connections();
+        println!("NordVPN proxy connections: {before} while downloading, {after} after Remove");
+        assert!(before > 0, "expected open NordVPN connections while downloading");
+        assert_eq!(after, 0, "Remove should close the download's NordVPN connections");
+        assert!(root.join(&entry.path).exists(), "finished files are kept");
+        let leftovers = entries.iter().filter(|e| part_file(&root.join(&e.path)).exists()).count();
+        assert_eq!(leftovers, 0, "partial files should be removed");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn numbered_paths_avoid_duplicates() {
+        assert_eq!(numbered("a/b/x.jpg", 0), "a/b/x.jpg");
+        assert_eq!(numbered("a/b/x.jpg", 2), "a/b/x (2).jpg");
+        assert_eq!(numbered("x", 1), "x (1)");
+    }
+
+    #[test]
+    fn display_segments_merge_finished_neighbours() {
+        let segments = vec![
+            Segment { start: 0, end: 10, pos: 10, busy: false },
+            Segment { start: 10, end: 20, pos: 20, busy: false },
+            Segment { start: 20, end: 30, pos: 25, busy: false },
+            Segment { start: 30, end: 40, pos: 30, busy: false },
+        ];
+        let shown = display_segments(&segments);
+        assert_eq!(shown.len(), 1);
+        assert_eq!((shown[0].start, shown[0].end, shown[0].pos), (0, 30, 25));
     }
 
     #[test]

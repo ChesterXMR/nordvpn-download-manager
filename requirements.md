@@ -74,3 +74,4 @@ download routed through its own NordVPN server.
 | # | Requirement | Status |
 |---|---|---|
 | 8.1 | gofile.io links download without manual steps. | Done. Both gofile.io/d/ share links and direct /download/web/ links are resolved through gofile's API with a guest account created through the download's NordVPN server (tested live with a real direct link). The user's own gofile token (Settings) is optional. |
+| 8.2 | MEGA file and folder links download without manual steps. | Done. Files are decrypted as they download; a folder link is one download that saves the whole folder (with sub-folders), several files at a time through one NordVPN server. Removing a download closes its NordVPN connections (tested live). |
